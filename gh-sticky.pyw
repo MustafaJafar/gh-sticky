@@ -45,6 +45,7 @@ FG = "#e8e6e3"
 FG_DIM = "#9a9893"
 GREEN = "#3fb950"
 RED = "#f85149"
+YELLOW = "#e3b341"
 
 # Layout: panels are rounded cards PAD from the window edge, with CARD_PAD
 # inside; in a card the arrow sits at the left and titles and item icons at
@@ -82,17 +83,32 @@ TEXT_GLYPHS = {
 ITEM_RE = re.compile(
     r"(?:https?://github\.com/)?([\w.-]+)/([\w.-]+)(?:/(?:pull|issues)/|#)(\d+)"
 )
+# The last few comments/reviews are fetched to find the newest one written by
+# someone else (not you, not a bot): that is what lights the "new" dot.
 QUERY_ITEM = """
   i%d: repository(owner: %s, name: %s) {
     issueOrPullRequest(number: %d) {
       __typename
-      ... on Issue { title state stateReason url }
+      ... on Issue {
+        id title state stateReason url viewerSubscription viewerCanSubscribe
+        comments(last: 5) { nodes { id author { __typename login } } }
+      }
       ... on PullRequest {
-        title state isDraft additions deletions url
+        id title state isDraft additions deletions url reviewDecision
+        viewerSubscription viewerCanSubscribe
+        comments(last: 5) { nodes { id author { __typename login } } }
+        reviews(last: 5) { nodes { id author { __typename login } } }
         commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
       }
     }
   }"""
+SUBSCRIBE_MUTATION = """
+mutation($id: ID!, $state: SubscriptionState!) {
+  updateSubscription(input: {subscribableId: $id, state: $state}) {
+    subscribable { viewerSubscription }
+  }
+}"""
+NOTIFICATION_RE = re.compile(r"/repos/([^/]+)/([^/]+)/(?:pulls|issues)/(\d+)$")
 
 
 def parse_items(text):
@@ -105,6 +121,31 @@ def split_key(key):
     return repo, int(number)
 
 
+def gh(*args):
+    return subprocess.run(
+        ["gh", *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+
+def utc_now():
+    """Current time in GitHub's timestamp format, so the two compare as text."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def last_by_others(nodes, viewer):
+    """Id of the newest comment/review not written by you or a bot."""
+    for node in reversed(nodes):
+        author = node.get("author") or {}
+        if author.get("login") != viewer and author.get("__typename") != "Bot":
+            return node["id"]
+    return None
+
+
 def fetch(keys):
     """Query GitHub for all keys at once, return {key: info}."""
     parts = []
@@ -114,18 +155,13 @@ def fetch(keys):
         parts.append(
             QUERY_ITEM % (index, json.dumps(owner), json.dumps(name), number)
         )
-    proc = subprocess.run(
-        ["gh", "api", "graphql", "-f", f"query=query {{{''.join(parts)}}}"],
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    proc = gh("api", "graphql", "-f", f"query=query {{ viewer {{ login }}{''.join(parts)}}}")
     try:
         data = json.loads(proc.stdout).get("data") or {}
     except ValueError:
         raise RuntimeError(proc.stderr.strip() or "gh failed") from None
+    viewer = (data.get("viewer") or {}).get("login")
+    notified = fetch_notifications()
 
     result = {}
     for index, key in enumerate(keys):
@@ -135,10 +171,20 @@ def fetch(keys):
             continue
         info = {
             "kind": "pr" if node["__typename"] == "PullRequest" else "issue",
+            "id": node["id"],
             "title": node["title"],
             "state": node["state"],
             "url": node["url"],
+            "subscription": node["viewerSubscription"],
+            "can_subscribe": node["viewerCanSubscribe"],
+            "notified_at": notified.get(key),
         }
+        # Anything changing here since you last looked lights the dot.
+        activity = [
+            node["state"],
+            node.get("reviewDecision"),
+            last_by_others(node["comments"]["nodes"], viewer),
+        ]
         if info["kind"] == "pr":
             commits = node["commits"]["nodes"]
             rollup = commits[0]["commit"]["statusCheckRollup"] if commits else None
@@ -147,11 +193,53 @@ def fetch(keys):
                 additions=node["additions"],
                 deletions=node["deletions"],
                 checks=rollup["state"] if rollup else None,
+                review=node["reviewDecision"],
             )
+            activity.append(last_by_others(node["reviews"]["nodes"], viewer))
         else:
             info["reason"] = node["stateReason"]
+        info["activity"] = activity
         result[key] = info
     return result
+
+
+def fetch_notifications():
+    """Return {key: updated_at} for your unread GitHub notifications.
+
+    Best effort: fine-grained tokens can't read notifications, so any failure
+    just means no notification-based dots.
+    """
+    proc = gh("api", "notifications?per_page=100")
+    try:
+        threads = json.loads(proc.stdout)
+    except ValueError:
+        return {}
+    if not isinstance(threads, list):
+        return {}
+    notified = {}
+    for thread in threads:
+        match = NOTIFICATION_RE.search((thread.get("subject") or {}).get("url") or "")
+        if match and thread.get("unread"):
+            owner, name, number = match.groups()
+            notified[f"{owner}/{name}#{number}"] = thread["updated_at"]
+    return notified
+
+
+def update_subscription(node_id, subscribe):
+    state = "SUBSCRIBED" if subscribe else "UNSUBSCRIBED"
+    proc = gh(
+        "api", "graphql",
+        "-f", f"query={SUBSCRIBE_MUTATION}",
+        "-f", f"id={node_id}",
+        "-f", f"state={state}",
+    )  # fmt: skip
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        data = None
+    if proc.returncode or not data or data.get("errors"):
+        errors = (data or {}).get("errors") or [{"message": proc.stderr.strip()}]
+        raise RuntimeError(errors[0].get("message") or "gh failed")
 
 
 def icon_name(info):
@@ -293,6 +381,50 @@ class Popup:
             self.app.popup = None
 
 
+class Tooltip:
+    """Small themed hint shown after hovering a widget for a moment."""
+
+    def __init__(self, app, widget, text):
+        self.app, self.widget, self.text = app, widget, text
+        self.job = self.top = None
+        widget.bind("<Enter>", self.schedule, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
+        widget.bind("<ButtonPress>", self.hide, add="+")
+
+    def schedule(self, _event=None):
+        self.hide()
+        self.job = self.widget.after(500, self.show)
+
+    def show(self):
+        if not self.widget.winfo_exists():
+            return
+        self.top = top = tk.Toplevel(self.widget)
+        top.overrideredirect(True)
+        top.attributes("-topmost", True)
+        top.configure(bg=BORDER)
+        tk.Label(
+            top,
+            text=self.text,
+            bg=MENU_BG,
+            fg=FG,
+            font=self.app.font_small,
+            justify="left",
+            wraplength=260,
+            padx=8,
+            pady=4,
+        ).pack(padx=1, pady=1)
+        x, y = self.widget.winfo_pointerxy()
+        top.geometry(f"+{x + 12}+{y + 16}")
+
+    def hide(self, _event=None):
+        if self.job:
+            self.widget.after_cancel(self.job)
+            self.job = None
+        if self.top is not None:
+            self.top.destroy()
+            self.top = None
+
+
 class StickyApp:
     def __init__(self, root):
         self.root = root
@@ -382,10 +514,11 @@ class StickyApp:
     def save_state(self):
         self.state["geometry"] = self.root.geometry()
         keys = {k for p in self.state["panels"] for k in p["items"]}
-        cache = self.state.setdefault("cache", {})
-        for key in list(cache):
-            if key not in keys:
-                del cache[key]
+        for section in ("cache", "seen"):
+            values = self.state.setdefault(section, {})
+            for key in list(values):
+                if key not in keys:
+                    del values[key]
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
         with open(STATE_FILE, "w", encoding="utf-8") as stream:
             json.dump(self.state, stream, indent=2)
@@ -433,16 +566,73 @@ class StickyApp:
         except queue.Empty:
             pass
         else:
-            self.refreshing = False
-            if status == "ok":
-                self.state.setdefault("cache", {}).update(payload)
-                self.status.configure(text="updated " + time.strftime("%H:%M"))
-                self.save_state()
-                self.render()
+            if status == "subscription-error":
+                self.subscription_failed(*payload)
             else:
-                self.status.configure(text="error: " + payload.splitlines()[0][:40])
-            self.schedule_refresh()
+                self.refreshing = False
+                if status == "ok":
+                    self.update_cache(payload)
+                    self.status.configure(text="updated " + time.strftime("%H:%M"))
+                    self.save_state()
+                    self.render()
+                else:
+                    self.status.configure(text="error: " + payload.splitlines()[0][:40])
+                self.schedule_refresh()
         self.root.after(200, self.poll_results)
+
+    def update_cache(self, fetched):
+        self.state.setdefault("cache", {}).update(fetched)
+        seen = self.state.setdefault("seen", {})
+        for key, info in fetched.items():
+            # A newly added item starts as read; only later activity counts.
+            if key not in seen and "activity" in info:
+                seen[key] = {"activity": info["activity"], "at": utc_now()}
+
+    # --- news dot and subscriptions ------------------------------------------
+    def has_news(self, key):
+        """True when others commented/reviewed or the state changed since you
+        last opened the item, or GitHub has a newer unread notification."""
+        info = self.state.get("cache", {}).get(key, {})
+        seen = self.state.get("seen", {}).get(key)
+        if not seen or "activity" not in info:
+            return False
+        if info["activity"] != seen["activity"]:
+            return True
+        notified_at = info.get("notified_at")
+        return bool(notified_at and notified_at > seen["at"])
+
+    def mark_seen(self, key):
+        info = self.state.get("cache", {}).get(key, {})
+        if "activity" in info:
+            self.state.setdefault("seen", {})[key] = {
+                "activity": info["activity"],
+                "at": utc_now(),
+            }
+            self.changed()
+
+    def set_subscription(self, key, subscribe):
+        """Flip the bell right away; put it back if GitHub refuses."""
+        info = self.state["cache"][key]
+        old = info.get("subscription")
+        info["subscription"] = "SUBSCRIBED" if subscribe else "UNSUBSCRIBED"
+        self.changed()
+
+        def worker():
+            try:
+                update_subscription(info["id"], subscribe)
+            except Exception as exc:  # noqa: BLE001 - shown in the status label
+                self.results.put(("subscription-error", (key, old, str(exc))))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def subscription_failed(self, key, old, message):
+        info = self.state.get("cache", {}).get(key)
+        if info:
+            info["subscription"] = old
+            self.changed()
+        if "notifications" in message and "scope" in message:
+            message = "run: gh auth refresh -s notifications"
+        self.status.configure(text="bell: " + message.splitlines()[0][:45])
 
     # --- panels and items ----------------------------------------------------
     def add_panel(self):
@@ -481,6 +671,7 @@ class StickyApp:
         info = self.state.get("cache", {}).get(key, {})
         repo, number = split_key(key)
         webbrowser.open(info.get("url") or f"https://github.com/{repo}/issues/{number}")
+        self.mark_seen(key)
 
     def copy(self, text):
         self.root.clipboard_clear()
@@ -837,10 +1028,19 @@ class StickyApp:
         row.pack(fill="x")
         icon = tk.Label(row, image=self.icons[icon_name(info)], bg=CARD_BG)
         icon.pack(side="left", anchor="n", padx=(INDENT, 10), pady=(6, 0))
+        # Right column, like Claude's: the ⋯ menu with the "new activity" dot
+        # under it.
+        side = tk.Frame(row, bg=CARD_BG)
+        side.pack(side="right", anchor="n", fill="y")
         more = tk.Label(
-            row, text=self.glyphs["more"], bg=CARD_BG, fg=FG_DIM, font=self.font_icon, padx=8
+            side, text=self.glyphs["more"], bg=CARD_BG, fg=FG_DIM, font=self.font_icon, padx=8
         )
-        more.pack(side="right", anchor="n", pady=(8, 0))
+        more.pack(pady=(8, 0))
+        dot = tk.Canvas(side, width=8, height=8, bg=CARD_BG, highlightthickness=0)
+        dot.pack(pady=(6, 0))
+        if self.has_news(key):
+            dot.create_oval(1, 1, 7, 7, fill=YELLOW, outline=YELLOW)
+            Tooltip(self, dot, "New activity since you last opened it. Open it to clear.")
 
         body = tk.Frame(row, bg=CARD_BG)
         body.pack(side="left", fill="x", expand=True, pady=4)
@@ -859,14 +1059,74 @@ class StickyApp:
         title.pack(fill="x")
         sub = tk.Frame(body, bg=CARD_BG)
         sub.pack(fill="x")
-        widgets = [row, icon, more, body, title, sub]
+        widgets = [row, icon, side, more, dot, body, title, sub]
         parts = [(f"{repo.split('/', 1)[1]} #{number}", FG_DIM)]
         if info.get("kind") == "pr" and info.get("state") == "OPEN":
             parts += [(f"+{info['additions']}", GREEN), (f"−{info['deletions']}", RED)]
+            parts += {
+                "APPROVED": [("approved", GREEN)],
+                "CHANGES_REQUESTED": [("changes requested", RED)],
+            }.get(info.get("review"), [])
+        has_review = info.get("kind") == "pr" and len(parts) == 4
+        if has_review:
+            # Room left on the second line: card width minus the icon column
+            # (INDENT + 30), the ⋯ column (32) and the bell (22); each label
+            # takes its text width plus 8px of padding.
+            room = width - INDENT - 30 - 32 - 22
+            room -= sum(self.font_small.measure(t) + 8 for t, _ in parts[:-1])
+            text, color = parts[-1]
+            text = elide(text, self.font_small, room - 8)
+            if len(text) < 6:  # "cha…" says nothing
+                parts.pop()
+                has_review = False
+            else:
+                parts[-1] = (text, color)
+        labels = []
         for text, color in parts:
-            label = tk.Label(sub, text=text, bg=CARD_BG, fg=color, font=self.font_small)
+            label = tk.Label(
+                sub, text=text, bg=CARD_BG, fg=color, font=self.font_small, anchor="w"
+            )
             label.pack(side="left", padx=(0, 4))
-            widgets.append(label)
+            labels.append(label)
+        widgets += labels
+        review_label = labels[-1] if has_review else None
+
+        # Bell at the end of the second line. Unsubscribed items always show
+        # it (click to subscribe); subscribed or muted ones show a crossed-out
+        # bell on hover only. Not in `widgets`, so clicking it doesn't open.
+        bell_mode = None
+        if info.get("can_subscribe") and info.get("id"):
+            bell_mode = {
+                "SUBSCRIBED": "unsubscribe",
+                "IGNORED": "unmute",
+            }.get(info.get("subscription"), "subscribe")
+        bell = tk.Label(sub, image=self.icons["blank"], bg=CARD_BG, cursor="hand2")
+        # Packing order decides who is clipped first when space runs out: bell,
+        # then hover actions, then the labels.
+        bell.pack(side="right", padx=(2, 0), before=labels[0])
+        if bell_mode:
+            bell.bind(
+                "<Button-1>",
+                self.later(lambda: self.set_subscription(key, bell_mode != "unsubscribe")),
+            )
+            Tooltip(self, bell, {
+                "subscribe": "Subscribe: GitHub will notify you about this one, "
+                "on the web and by email, depending on your GitHub settings.",
+                "unsubscribe": "Unsubscribe: stop GitHub notifications for this one.",
+                "unmute": "You muted this on GitHub. Click to subscribe again "
+                "(web and email notifications, per your GitHub settings).",
+            }[bell_mode])  # fmt: skip
+
+        def show_bell(hovered):
+            if bell_mode == "subscribe":
+                name = "bell-hover" if hovered else "bell"
+            elif bell_mode:
+                name = "bell-off-hover" if hovered else "blank"
+            else:
+                name = "blank"
+            bell.configure(image=self.icons[name], bg=BG_HOVER if hovered else CARD_BG)
+
+        show_bell(False)
 
         # Item actions, shown on the second line while hovering the row; that
         # line has room to spare, so the title keeps its width.
@@ -897,15 +1157,30 @@ class StickyApp:
             for widget in widgets:
                 widget.configure(bg=BG_HOVER if hovered else CARD_BG)
             more.configure(fg=FG if hovered else FG_DIM)
+            show_bell(hovered)
             if hovered:
-                actions.pack(side="right")
+                # Ahead of the labels, so a narrow window clips the end of the
+                # second line, not the buttons.
+                actions.pack(side="right", before=labels[0])
+                # A review word cut down to a few letters reads as garbage;
+                # hide it while hovering when the buttons leave no room.
+                needed = sum(w.winfo_reqwidth() + 4 for w in labels)
+                needed += actions.winfo_reqwidth() + bell.winfo_reqwidth() + 2
+                if review_label and needed > sub.winfo_width():
+                    review_label.pack_forget()
             else:
                 actions.pack_forget()
                 self.reset_confirm(delete)
+                if review_label and not review_label.winfo_manager():
+                    review_label.pack(side="left", padx=(0, 4), after=labels[-2])
 
         menu = [
             ("Open in browser", lambda: self.open_item(key)),
             ("Copy URL", lambda: self.copy(info.get("url") or key)),
+        ]
+        if self.has_news(key):
+            menu.append(("Mark as read", lambda: self.mark_seen(key)))
+        menu += [
             None,
             ("Move up", lambda: self.move(panel["items"], key, -1)),
             ("Move down", lambda: self.move(panel["items"], key, 1)),
@@ -920,7 +1195,7 @@ class StickyApp:
         self.hover(row, widgets, lambda: set_hover(True), lambda: set_hover(False))
         for widget in widgets:
             if widget is not more:
-                widget.bind("<Button-1>", lambda e: self.open_item(key))
+                widget.bind("<Button-1>", self.later(lambda: self.open_item(key)))
             widget.bind(RIGHT_CLICK, lambda e: self.show_popup(e, menu))
         more.bind("<Button-1>", lambda e: self.show_popup(e, menu))
 
@@ -1111,6 +1386,69 @@ ICONS = {
         "b5z8GlfRd0RRlLZAoK55c3Mj2dF6odWybaZpGi95jVqWZGsaNweTTZWqr9+n+vZn0mkAIPBV"
         "10DWyeY557dutF3sJSJERAAA+mtYxYzrus78ew/Wizyvl2RZkRj76KWzLzs6Ln//Bd59Uzud"
         "7B/XKpf3fgLOckgZqQ/2oQAAAABJRU5ErkJggg=="
+    ),
+    "bell": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAACHUlEQVR42q2TsWsTURzHv793"
+        "L5cLpsJhqJQK0sXBGxwcxDGuriZrF6GNQQk4SAe5y1QEl16kaWIdBLFw+RNEDtwcuih1cRNE"
+        "2loObWk0uXdfhxhItUVBf9Pj+x6f3/f33vcB/1hynBhFkQUAe3vb14TZ3ELtznqv15NqtWr+"
+        "ikpSAKDbaa122+GHX/UTHYwPhGE4NVW0H4CYB1mg4MX+waDeaDTekxQR4bEA3/cVAHVudvql"
+        "ndPnv/X7dw1Uks/peyCv9ge8sLu7uxMEASchR+budMLrTx6vcnV52Z3cX+88etdph20AiONY"
+        "j3U1tl6pVLiyspKXDPeHw+HGraWlxPd9O4oim6QYYx7mcvpGtxvOlctl89PtCAAAIpLNOI4j"
+        "Sl2hqC5J8TzPVCqVoYjQ7acbaWpcEhcB0PM8OQIAgCRJQPI7meZ/m7FYtEkaY0w6KU8CpGBZ"
+        "KUltWcjHsa+LxaLe3NzUcezr/mCgAVhK5fqTz6kBIAgCAZCZQmEKyPZFrLflcjMFMNltr9sO"
+        "DzKml0XkVRRFo64kJQgCKZVKrmPLa4CnSD4jSRGlR5ecpaM1q07emd0/PLxUrzfe+L6vZByM"
+        "Vqt1xrHluSgpZCY7DbDEDJ8AQBRmCPlsifoK4MswU4u1Wu0jSZGT4txZa63bOncWAAbpcHth"
+        "8fbNP36mcRI9z2OSJNOWpE8BwFDPu667s7W1JQCyZrNJAMT/qB+x1wdLc41V8QAAAABJRU5E"
+        "rkJggg=="
+    ),
+    "bell-hover": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAABzklEQVR42rVTsY7TUBCcec/E"
+        "RBFBkZA4ICkQoqbgB5DQFegqGjoahPgK7juuoUT8AB1NWigQUogorADH2Y7t5OIgQDmb2B6K"
+        "i6UgckQUbLdvRrszu2+B/xGSrCQbh+FuPPafSDKS7CauOaNGRbI0BvcBPCVZkSwlcVtnSqLn"
+        "ee15OjlIj5PFbBornSavRqPRzZrzNwUEYDvt1kvH2nvZyc+Hiyy7C0idduttknzeAcCNSmqP"
+        "UeTvzaaxBoNBZx2fJuGHKDw6WHGdTdKN53luPA5ej/0vLwBgOBw2JDUkMQqOHs2mk2kUHV6v"
+        "+b8VAIA0TS9O4lB+5N9ZkWyNSWrG46CI/MO9dcV/bKEsq9xUcklq/X0+nzcklZUxxcYhSmKe"
+        "5wUAR5K78umscmexWDgALImT9SHWBUhSxpgLAL4Xhd6TLEjmJJcki263OwPwoyzL2+vq6pUw"
+        "DMNOw/INgFaF6nlVQcTptAUWhBySD1qt1rWv3+a3er0bA0nGWbWvgiAAqI+EaaLSLsFLEKJT"
+        "HFcAHFtjP+VZ9q6pc7Pa+ZlfMx77z1z3/GUAyPMs2bnae7z1FiSZfr/vSLLGcfeLcukW5dI1"
+        "jrsvya4ws/Um/iV+AU7nKlvE98NqAAAAAElFTkSuQmCC"
+    ),
+    "bell-off": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAC4klEQVR42o2TX0hTcRTHz/nd"
+        "63bv9G7JlhE99eLLcpAsCCyXRA9JBJErtVLSWn/MrNDoJXZ96CVF0pnLmZblvy5FEEH0pK+F"
+        "jcqGig+VPhRTNLfc/HPv7/RQphlSXzhvXw7nnM/5AvwUgxXhr/pvMcYYuN3uqo0ZG+8iIng8"
+        "HlHTNKEtGNh3p6XRR0RM0zRh3QZut7uq/uYNys3dRVarNSSKIgAABFsag6Fg0/iykYj+mkz0"
+        "er04MDDgevb8BRQeOZwgzk+/Cb/Vux+2xxOJ5EnOubmjPfgyFl+4gIhjRISISKv3ZYjIFUUJ"
+        "uVzbThcXepcedPWm2KyKXllx9uj454lvZsl8DQB2Jhcpc3JyMqqqKv3VhDEGiqK0ut3ZevD2"
+        "rUR29vYkANQtm0KtgZHWYFMQAKC/v1+EVdcnv98PnHOMxWKVktn8tfNhj3yqrETI3Z1TnZHh"
+        "6GSMARn8piiK3lCoaWteXp7h9/vZb3yqqhIAUHNzs3LGd0peWtLfddzvSikqLFjIzMwskWWp"
+        "5eLlqx26Ydh0nTsBgJxOJwIAiKsvqk9NGQnBrjQ11J3P8ew9ZJGl6uJC7zw3jHMfP43b01JT"
+        "5+Jzcf0PhKsfyJ6WtgQIwtDwB7sgCDUjo2MPHmlPpOPHivQtWzYf6dMe21wu5zQAYCQSWZlA"
+        "VVUEAG7IsgLAY5wbEcMwIBqNlkaj0Ynvc3M15WUlifud3XJ+foGPMfa6traWAACRiFBVVXQ4"
+        "HOmSCV8BUCoRdREhEefihnSbHmq7V5FMJi0njhct9vRqpvdDkbZ4PO4jIobLjxEIBOySCXuQ"
+        "ocwNbgUgB3H6AohosVhM9Q2N85Ik7Sg9UTzfpz2RhkdGO/Z49vjWDU3rncBdk5iyiRPh4uLC"
+        "dEXllRKbzdqelbWt7OCB/dCnPb00ODgY+IPCL7bM6XTSzMzMdYPrnYhIOheucc6F2dlY+fDI"
+        "KCUS80PhcLhxDYR/am3MGQDADw+YS4CU/ujgAAAAAElFTkSuQmCC"
+    ),
+    "bell-off-hover": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAACjklEQVR42o2TO0+TcRTGn/8l"
+        "pVJsG1ECbJr4EXQwYtvX1krgbasJowwa8ZKYxk/QxUVJHCHWQoKDiay6wFIGNxJgMpq05b21"
+        "by/UGg1QezsOFAWBhCc52zm/nPOcPMCeOAAwxgCAdetU4gC4lLITVJS4x3M2JYSgRMInFhcX"
+        "RTGfDxUL5hQRcSISxxISiQRXFCW+sbZKsViEpJTJnp4eAIBtGrPFgmns9xLR0c0mJiaE1+ue"
+        "i8UiZGjZbVUdJwAzRM2XtWq5Xq0UqVYtL2UymcsnQTjnHFKKpKqOkaFlG+FwiCYn7zWJ6K6m"
+        "ZZRq2V6ulu2fpdLmYPecQxAGgEshwRh7Ewj4Wqae27kxcn0XwPR+U8k2v9p5Y7a7hTziAwBG"
+        "RI6IOm6FwyEytGwjGlXJ7XYvSCFhGZv3tyqlLdvWLhIRIyKO/82xrC/99Z1fVb/ft6EofjL1"
+        "XF1VxwjATF9fH4oFs6lp2fHujDgCWF9f99p5o0FE1wBMR6MqGXp2d3Q0TAMDFz406ts/CoZx"
+        "+1hAt1wFS2/buq46HA54PJ6FO7EoGVq2GQj46emTR0REVwGwdDotDwI4AJRKpUE7b9Z0/dul"
+        "Axa98PlGfht6bjsYVDpOpzMlhQQAAYDxf/db/azT+iw4r/c4ep8U8uYry8i9Jmo6hoaGWw+n"
+        "HvfOp942g0HlARglOedtAIwREWOMkWVZ/Q6J9wz8TLvTchOx8x1q2xycec95HTeDt+oul+vK"
+        "fCpZfxZ/7lxZWZkPhcJTJ4akWDBTtWrl4/dK8ZNlbL6TUsLpdM7FYhHaWFslRVHi3ffjkBfp"
+        "dFoSkSiXy0OVUmG5WrGXdF0fBiCkFPB63amgosSllH9TfFqxvcSzg0nGH9DgaIJ2LAjFAAAA"
+        "AElFTkSuQmCC"
+    ),
+    "blank": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAEklEQVR42mNgGAWjYBSMAggA"
+        "AAQQAAGvRYgsAAAAAElFTkSuQmCC"
     ),
 }
 

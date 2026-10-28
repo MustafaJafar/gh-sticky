@@ -14,9 +14,18 @@ Claude desktop app.
   actions, double-click it to rename).
 - Items are added by hand: paste one or more PR/issue links (or
   `owner/repo#123`) into a panel's add box. No filters or searches.
-- Each item shows its title, `repo #number`, `+additions −deletions` for open
-  PRs, and an icon for its state: CI result for open PRs (passed, failed,
-  running), draft, merged, closed, or the issue state.
+- Each item shows its title, `repo #number`, `+additions −deletions` and the
+  review decision (approved / changes requested) for open PRs, and an icon for
+  its state: CI result for open PRs (passed, failed, running), draft, merged,
+  closed, or the issue state.
+- A yellow dot marks new activity since you last opened the item: a comment or
+  review by someone else (not you, not a bot), a state or review change, or a
+  newer unread GitHub notification. Opening the item (or "Mark as read")
+  clears it.
+- A bell shows on items you're not subscribed to; click it to subscribe. That
+  turns on GitHub notifications for that PR or issue, on the web and by email,
+  depending on your GitHub notification settings. On subscribed items, hover
+  to get the crossed-out bell to unsubscribe.
 - Click an item to open it in the browser. Hover it to add more items, move it
   up or down, or remove it; right-click or `⋯` also copies its URL or moves it
   to another panel.
@@ -36,6 +45,16 @@ Claude desktop app.
   installer; on Linux install `python3-tk` or your distribution's equivalent).
 - [GitHub CLI](https://cli.github.com/) installed and logged in
   (`gh auth login`). The tool stores no tokens; it only calls `gh`.
+- For the bell (subscribe / unsubscribe), gh's token also needs the
+  `notifications` scope, which the default login doesn't include. Add it once:
+
+  ```bash
+  gh auth refresh -s notifications
+  ```
+
+  Without it everything else works; the bell shows this hint when clicked.
+  Notification-based dots need a classic token (gh's default); fine-grained
+  tokens can't read notifications, so the dot then relies on activity only.
 
 No other packages.
 

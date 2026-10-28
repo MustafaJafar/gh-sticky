@@ -1127,6 +1127,18 @@ class StickyApp:
             bell.configure(image=self.icons[name], bg=BG_HOVER if hovered else CARD_BG)
 
         show_bell(False)
+        if bell_mode == "unsubscribe":
+            # Red while the pointer is on the bell itself: it's a "turn off".
+            bell.bind(
+                "<Enter>",
+                lambda e: bell.configure(image=self.icons["bell-off-red"]),
+                add="+",
+            )
+            bell.bind(
+                "<Leave>",
+                lambda e: bell.configure(image=self.icons["bell-off-hover"]),
+                add="+",
+            )
 
         # Item actions, shown on the second line while hovering the row; that
         # line has room to spare, so the title keeps its width.
@@ -1449,6 +1461,23 @@ ICONS = {
     "blank": (
         "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAEklEQVR42mNgGAWjYBSMAggA"
         "AAQQAAGvRYgsAAAAAElFTkSuQmCC"
+    ),
+    "bell-off-red": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAC3ElEQVR42o2TS0iUYRSG3/P9"
+        "F2cczZyJmWm6al4qqWghWhSWJZN2m6Es2gh2g25YUNEiGIVWtQqhSM0uVIuCIqOFZaEgibsk"
+        "mArT0KhMasZLzsX5//+0mNQpizqrA985L+85z3eAeAgAoHhOU+m/gwAIBTCKc7OqOr6Hl419"
+        "/Lj/bFGRXG23c0QbLgaLDNOKggb4/UT37unTFHyAcC/JqurdUsI7l+cxOZ11JoobCHk3XY54"
+        "S/snavkPzmR/eTl1vGhffrrvExoXzQ3pBh94YLDG6wtGNc2oFOAkbWdZ81h4/Cg9bulmgAjg"
+        "X0YQgMFOZ51nlvXA9UXzYnu6+xSXImn1edm7h0ajQ8kKnQFQGJOQY1maP4iaGp4mIhMAh+PK"
+        "xsU52uh2d2j94pwwrNYLE0Vhb9mbiHfTZQDgoiIZCdtnHwCNQfys9liqEAO7u/vMD3MzpB1z"
+        "Zp9McbluyASAjfMQUnl4a0kG2tp09vnEJL7quB0eOXsl9X5eljmqG1073r5XrmXOjZbYZlZo"
+        "dscl+6MnjWwYaeMS5RHA8PsJAOTEjQaCmq6ka6ktq1YepqZn3kpFOXk9c34kZhiHOhXFZlLk"
+        "MT2ma4k9IhHRQlWNASSFgsM2Nfjt1NNvwZv7ej+Ybmct0FakJO860dOfZrHaAgCodXBwCin/"
+        "FOKyMmfYUxoc2rwhc/IxLf1ccW52dMTjHnMvyTVUl6tBjrdKAIgYIPh8NNLVnm4SaieYLQbT"
+        "LRCzzixbVFWreN1zJKAbyXeyF4xX9PSrTV+D9TQwcNAABE18jGGPx2YS0TuCYdYZMwCeZQCf"
+        "QSCzLKtrX76JpMhS/t2cjMje3g+mJ4FAo3v1moN/PZqQt7QhSRIOnUFRXQ9YHzZXkMN5dZvd"
+        "uvf8fBcO9bw/Xvj6Xe0vAuzzidbWVrHObmdoI/YYSTcEwFFtvNLS1PJFJtKTXa6GVSnmV8/f"
+        "vrsYS4Dwv5dL9BvBHw/EJhY9B4spAAAAAElFTkSuQmCC"
     ),
 }
 

@@ -1,14 +1,14 @@
 # gh-sticky
 
+A small always-on-top window that keeps hand-picked GitHub pull requests and
+issues in front of you, grouped in panels, styled after the Changes list in the
+Claude desktop app.
+
 <!-- A table rather than <img align="right">: the float is ignored by some
      previews (VS Code); a table lays out the same everywhere. -->
 <table>
 <tr>
 <td valign="top">
-
-A small always-on-top window that keeps hand-picked GitHub pull requests and
-issues in front of you, grouped in panels, styled after the Changes list in the
-Claude desktop app.
 
 - Panels are created, renamed and reordered inline (hover a panel title for its
   actions, double-click it to rename).
@@ -33,8 +33,8 @@ Claude desktop app.
   `gh api graphql` call.
 
 </td>
-<td valign="top" width="300">
-<img src="docs/screenshot.png" alt="gh-sticky window with two panels of PRs and issues" width="300">
+<td valign="top" width="45%">
+<img src="docs/screenshot.png" alt="gh-sticky window with two panels of PRs and issues" width="100%">
 </td>
 </tr>
 </table>

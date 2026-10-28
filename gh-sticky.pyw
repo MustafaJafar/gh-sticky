@@ -3,8 +3,10 @@
 Panels and items are added by hand (paste a URL or `owner/repo#123`); each
 item's title, state, diff size and CI status are read with `gh api graphql`
 every few minutes. On Windows run it with `pythonw` so no console stays open.
-State (panels, items, window position) is kept in STATE_FILE.
+State (panels, items, window position) is kept in STATE_FILE, or in the file
+given with `--state`.
 """
+import argparse
 import json
 import os
 import queue
@@ -26,6 +28,7 @@ elif MACOS:
     CONFIG_DIR = os.path.expanduser("~/Library/Application Support")
 else:
     CONFIG_DIR = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+# Default state file; `--state <path>` replaces it.
 STATE_FILE = os.path.join(CONFIG_DIR, "gh-sticky", "state.json")
 # Tk 8.6 on macOS reports the right mouse button as Button-2.
 RIGHT_CLICK = "<Button-2>" if MACOS else "<Button-3>"
@@ -1075,6 +1078,16 @@ ICONS = {
 }
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Always-on-top list of hand-picked GitHub PRs and issues."
+    )
+    parser.add_argument(
+        "--state",
+        default=STATE_FILE,
+        metavar="PATH",
+        help="state file to read and save (default: %(default)s)",
+    )
+    STATE_FILE = os.path.abspath(os.path.expanduser(parser.parse_args().state))
     root = tk.Tk()
     StickyApp(root)
     root.mainloop()

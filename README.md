@@ -1,5 +1,11 @@
 # gh-sticky
 
+<!-- A table rather than <img align="right">: the float is ignored by some
+     previews (VS Code); a table lays out the same everywhere. -->
+<table>
+<tr>
+<td valign="top">
+
 A small always-on-top window that keeps hand-picked GitHub pull requests and
 issues in front of you, grouped in panels, styled after the Changes list in the
 Claude desktop app.
@@ -15,6 +21,13 @@ Claude desktop app.
   and remove.
 - Refreshes every 5 minutes (or with the refresh button) through one
   `gh api graphql` call.
+
+</td>
+<td valign="top" width="300">
+<img src="docs/screenshot.png" alt="gh-sticky window with two panels of PRs and issues" width="300">
+</td>
+</tr>
+</table>
 
 ## Requirements
 
@@ -32,11 +45,14 @@ No other packages.
 pythonw gh-sticky.pyw
 # Linux / macOS
 python3 gh-sticky.pyw
+# Use another state file, e.g. one per project or a synced folder
+python3 gh-sticky.pyw --state ~/Dropbox/gh-sticky.json
 ```
 
 ## State
 
-Panels, items, the last fetched data and the window geometry are saved to:
+Panels, items, the last fetched data and the window geometry are saved to the
+file given with `--state`, or by default to:
 
 | OS | Path |
 |---|---|

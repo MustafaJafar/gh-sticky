@@ -756,7 +756,10 @@ class StickyApp:
             actions, self.glyphs["delete"], lambda: None, bg=CARD_BG, icon=True
         )
         delete.bind(
-            "<Button-1>", self.later(lambda: self.confirm_delete(panel, delete))
+            "<Button-1>",
+            self.later(
+                lambda: self.confirm(delete, "Delete?", lambda: self.delete_panel(panel))
+            ),
         )
         delete.pack(side="right")
         buttons = [
@@ -775,7 +778,7 @@ class StickyApp:
 
         def hide():
             actions.pack_forget()
-            delete.configure(text=self.glyphs["delete"], font=self.font_icon, fg=FG_DIM)
+            self.reset_confirm(delete)
 
         self.hover(header, [header, arrow, title], show, hide)
         menu = [
@@ -814,13 +817,17 @@ class StickyApp:
             self.click_job = None
         self.start_edit(panel, "title")
 
-    def confirm_delete(self, panel, button):
+    def confirm(self, button, question, action):
+        """Two-click delete: the first click turns the ✕ into a red question."""
         if not button.winfo_exists():
             return
         if button.cget("text") == self.glyphs["delete"]:
-            button.configure(text="Delete?", font=self.font_small, fg=RED)
+            button.configure(text=question, font=self.font_small, fg=RED)
         else:
-            self.delete_panel(panel)
+            action()
+
+    def reset_confirm(self, button):
+        button.configure(text=self.glyphs["delete"], font=self.font_icon, fg=FG_DIM)
 
     def render_item(self, card, panel, panels, key, width):
         info = self.state.get("cache", {}).get(key, {})
@@ -861,10 +868,40 @@ class StickyApp:
             label.pack(side="left", padx=(0, 4))
             widgets.append(label)
 
+        # Item actions, shown on the second line while hovering the row; that
+        # line has room to spare, so the title keeps its width.
+        actions = tk.Frame(sub, bg=BG_HOVER)
+        delete = self.flat_button(
+            actions, self.glyphs["delete"], lambda: None, bg=BG_HOVER, icon=True
+        )
+        delete.bind(
+            "<Button-1>",
+            self.later(
+                lambda: self.confirm(
+                    delete, "Remove?", lambda: self.remove_item(panel, key)
+                )
+            ),
+        )
+        delete.pack(side="right")
+        buttons = [
+            ("down", lambda: self.move(panel["items"], key, 1)),
+            ("up", lambda: self.move(panel["items"], key, -1)),
+            ("add", lambda: self.start_edit(panel, "add")),
+        ]
+        for glyph, command in buttons:
+            self.flat_button(
+                actions, self.glyphs[glyph], command, bg=BG_HOVER, icon=True
+            ).pack(side="right")
+
         def set_hover(hovered):
             for widget in widgets:
                 widget.configure(bg=BG_HOVER if hovered else CARD_BG)
             more.configure(fg=FG if hovered else FG_DIM)
+            if hovered:
+                actions.pack(side="right")
+            else:
+                actions.pack_forget()
+                self.reset_confirm(delete)
 
         menu = [
             ("Open in browser", lambda: self.open_item(key)),

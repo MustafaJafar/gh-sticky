@@ -17,8 +17,9 @@ Claude desktop app.
 - Each item shows its title, `repo #number`, `+additions −deletions` for open
   PRs, and an icon for its state: CI result for open PRs (passed, failed,
   running), draft, merged, closed, or the issue state.
-- Click an item to open it in the browser; right-click or `⋯` for copy, move
-  and remove.
+- Click an item to open it in the browser. Hover it to add more items, move it
+  up or down, or remove it; right-click or `⋯` also copies its URL or moves it
+  to another panel.
 - Refreshes every 5 minutes (or with the refresh button) through one
   `gh api graphql` call.
 

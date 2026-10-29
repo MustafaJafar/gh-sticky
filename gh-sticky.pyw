@@ -601,14 +601,13 @@ class StickyApp:
         notified_at = info.get("notified_at")
         return bool(notified_at and notified_at > seen["at"])
 
-    def mark_seen(self, key):
-        info = self.state.get("cache", {}).get(key, {})
-        if "activity" in info:
-            self.state.setdefault("seen", {})[key] = {
-                "activity": info["activity"],
-                "at": utc_now(),
-            }
-            self.changed()
+    def mark_seen(self, *keys):
+        seen = self.state.setdefault("seen", {})
+        for key in keys:
+            info = self.state.get("cache", {}).get(key, {})
+            if "activity" in info:
+                seen[key] = {"activity": info["activity"], "at": utc_now()}
+        self.changed()
 
     def set_subscription(self, key, subscribe):
         """Flip the bell right away; put it back if GitHub refuses."""
@@ -942,6 +941,16 @@ class StickyApp:
         title.bind("<Button-1>", lambda e: self.click_title(panel))
         title.bind("<Double-Button-1>", self.later(lambda: self.rename(panel)))
 
+        # Yellow dot when any item has news, lined up with the items' dots
+        # (centre 16px from the right) and visible while collapsed too.
+        news = [key for key in panel["items"] if self.has_news(key)]
+        dot = tk.Canvas(header, width=8, height=8, bg=CARD_BG, highlightthickness=0)
+        dot.pack(side="right", padx=(4, 12))
+        if news:
+            dot.create_oval(1, 1, 7, 7, fill=YELLOW, outline=YELLOW)
+            count = f"{len(news)} item{'s' if len(news) > 1 else ''}"
+            Tooltip(self, dot, f"{count} with new activity.")
+
         actions = tk.Frame(header, bg=CARD_BG)
         delete = self.flat_button(
             actions, self.glyphs["delete"], lambda: None, bg=CARD_BG, icon=True
@@ -977,6 +986,10 @@ class StickyApp:
             ("Rename", lambda: self.rename(panel)),
             ("Move up", lambda: self.move(panels, panel, -1)),
             ("Move down", lambda: self.move(panels, panel, 1)),
+        ]
+        if news:
+            menu.append(("Mark all as read", lambda: self.mark_seen(*news)))
+        menu += [
             None,
             ("Delete panel", lambda: self.delete_panel(panel), "danger"),
         ]

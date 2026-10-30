@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import uuid
 import webbrowser
 from tkinter import font as tkfont
 
@@ -108,12 +109,19 @@ mutation($id: ID!, $state: SubscriptionState!) {
     subscribable { viewerSubscription }
   }
 }"""
+# Notes share the panels' item lists with GitHub keys; their text and done
+# state live in state["notes"] under keys with this prefix.
+NOTE_PREFIX = "note:"
 NOTIFICATION_RE = re.compile(r"/repos/([^/]+)/([^/]+)/(?:pulls|issues)/(\d+)$")
 
 
 def parse_items(text):
     """Return `owner/repo#number` keys for every GitHub reference in text."""
     return [f"{o}/{r}#{n}" for o, r, n in ITEM_RE.findall(text or "")]
+
+
+def is_note(key):
+    return key.startswith(NOTE_PREFIX)
 
 
 def split_key(key):
@@ -447,6 +455,7 @@ class StickyApp:
         self.font = tkfont.Font(family=family, size=10)
         self.font_bold = tkfont.Font(family=family, size=10, weight="bold")
         self.font_small = tkfont.Font(family=family, size=9)
+        self.font_done = tkfont.Font(family=family, size=10, overstrike=True)
         icon_family = next(
             (f for f in ("Segoe Fluent Icons", "Segoe MDL2 Assets") if f in families),
             None,
@@ -514,7 +523,7 @@ class StickyApp:
     def save_state(self):
         self.state["geometry"] = self.root.geometry()
         keys = {k for p in self.state["panels"] for k in p["items"]}
-        for section in ("cache", "seen"):
+        for section in ("cache", "seen", "notes"):
             values = self.state.setdefault(section, {})
             for key in list(values):
                 if key not in keys:
@@ -539,7 +548,9 @@ class StickyApp:
     def refresh(self):
         if self.refreshing:
             return
-        keys = sorted({k for p in self.state["panels"] for k in p["items"]})
+        keys = sorted(
+            {k for p in self.state["panels"] for k in p["items"] if not is_note(k)}
+        )
         if not keys:
             self.status.configure(text="")
             self.schedule_refresh()
@@ -661,6 +672,34 @@ class StickyApp:
         panel["items"].remove(key)
         self.changed()
 
+    # --- notes: local text items with a checkbox ------------------------------
+    def new_note(self, text):
+        key = f"{NOTE_PREFIX}{uuid.uuid4().hex[:8]}"
+        self.state.setdefault("notes", {})[key] = {"text": text, "done": False}
+        return key
+
+    def toggle_done(self, key):
+        note = self.state["notes"][key]
+        note["done"] = not note["done"]
+        self.changed()
+
+    def clear_done(self, panel):
+        notes = self.state.get("notes", {})
+        panel["items"] = [
+            k for k in panel["items"] if not (is_note(k) and notes[k]["done"])
+        ]
+        self.changed()
+
+    def link_note(self, panel, key, github_key):
+        """Replace a note with the PR/issue it became, in the same spot."""
+        items = panel["items"]
+        if github_key in items:
+            items.remove(key)
+        else:
+            items[items.index(key)] = github_key
+        self.changed()
+        self.refresh()
+
     def toggle(self, panel):
         self.click_job = None
         panel["collapsed"] = not panel.get("collapsed", False)
@@ -677,11 +716,18 @@ class StickyApp:
         self.root.clipboard_append(text)
 
     # --- inline editing ------------------------------------------------------
-    def start_edit(self, panel, field, new=False):
-        """Show an inline entry: the panel title, or the add-items box."""
+    # Inline edit fields: "title" (panel name) and "note" (a note's text) save
+    # when you click away; "add" (the add box) and "link" (link a note to a PR
+    # or issue) close when left empty and stay open otherwise.
+    SAVE_ON_LEAVE = ("title", "note")
+
+    def start_edit(self, panel, field, new=False, key=None):
+        """Show an inline entry for a panel title, a note, or the add box."""
         self.end_edit()
         if field == "title":
             text = panel["title"]
+        elif field == "note":
+            text = self.state["notes"][key]["text"]
         else:
             try:
                 text = " ".join(parse_items(self.root.clipboard_get()))
@@ -691,6 +737,7 @@ class StickyApp:
         self.edit = {
             "panel": panel,
             "field": field,
+            "key": key,
             "var": tk.StringVar(value=text),
             "new": new,
             "select": True,
@@ -698,16 +745,28 @@ class StickyApp:
         self.render(force=True)
 
     def end_edit(self):
-        """Close the inline edit without rendering, keeping a typed title."""
+        """Close the inline edit without rendering, keeping a typed title or
+        note text."""
         edit, self.edit = self.edit, None
-        if not edit or edit["field"] != "title":
+        if not edit or edit["field"] not in self.SAVE_ON_LEAVE:
             return
         text = edit["var"].get().strip()
-        if text:
+        if edit["field"] == "note":
+            # An emptied note keeps its old text; ✕ is there to remove it.
+            if text:
+                self.state["notes"][edit["key"]]["text"] = text
+        elif text:
             edit["panel"]["title"] = text
         elif edit["new"]:
             self.state["panels"].remove(edit["panel"])
         self.save_state()
+
+    def leave_edit(self):
+        """The pointer or focus went elsewhere: save, or close if empty."""
+        if self.edit["field"] in self.SAVE_ON_LEAVE:
+            self.submit_edit()
+        elif not self.edit["var"].get().strip():
+            self.cancel_edit()
 
     def click_anywhere(self, event):
         # Click actions run via later(), so this sees the edit open before
@@ -716,10 +775,7 @@ class StickyApp:
             return
         if event.widget is self.edit_entry:
             return
-        if self.edit["field"] == "title":
-            self.submit_edit()
-        elif not self.edit["var"].get().strip():
-            self.cancel_edit()
+        self.leave_edit()
 
     def make_entry(self, parent, font):
         entry = tk.Entry(
@@ -753,16 +809,13 @@ class StickyApp:
             focus = None
         if focus is entry:
             return
-        if self.edit["field"] == "title":
-            self.submit_edit()
-        elif not self.edit["var"].get().strip():
-            self.cancel_edit()
+        self.leave_edit()
 
     def submit_edit(self):
         edit = self.edit
         panel = edit["panel"]
         text = edit["var"].get().strip()
-        if edit["field"] == "title":
+        if edit["field"] in self.SAVE_ON_LEAVE:
             self.end_edit()
             self.render(force=True)
             return
@@ -771,13 +824,24 @@ class StickyApp:
             self.cancel_edit()
             return
         keys = parse_items(text)
-        if not keys:
-            self.edit_entry.configure(highlightbackground=RED, highlightcolor=RED)
+        if edit["field"] == "link":
+            if not keys:
+                self.edit_entry.configure(highlightbackground=RED, highlightcolor=RED)
+                return
+            self.edit = None
+            self.link_note(panel, edit["key"], keys[0])
             return
-        panel["items"].extend(k for k in dict.fromkeys(keys) if k not in panel["items"])
+        # The add box: GitHub links become tracked items, anything else a note.
+        if keys:
+            panel["items"].extend(
+                k for k in dict.fromkeys(keys) if k not in panel["items"]
+            )
+        else:
+            panel["items"].append(self.new_note(text))
         edit["var"].set("")
         self.changed()
-        self.refresh()
+        if keys:
+            self.refresh()
 
     def cancel_edit(self):
         edit, self.edit = self.edit, None
@@ -916,7 +980,7 @@ class StickyApp:
         if not panel["items"] and not editing:
             hint = tk.Label(
                 card,
-                text="Empty. Hover the title and click + to add items.",
+                text="Empty. Hover the title and click + to add PRs, issues or notes.",
                 bg=CARD_BG,
                 fg=FG_DIM,
                 font=self.font_small,
@@ -924,7 +988,10 @@ class StickyApp:
             )
             hint.pack(fill="x", padx=(INDENT, 4), pady=(0, 4))
         for key in panel["items"]:
-            self.render_item(card, panel, panels, key, width)
+            if is_note(key):
+                self.render_note(card, panel, panels, key, width)
+            else:
+                self.render_item(card, panel, panels, key, width)
 
     def render_title(self, header, arrow, panel, panels, width):
         """Panel title plus its actions, shown while hovering the header."""
@@ -989,6 +1056,9 @@ class StickyApp:
         ]
         if news:
             menu.append(("Mark all as read", lambda: self.mark_seen(*news)))
+        notes = self.state.get("notes", {})
+        if any(is_note(k) and notes[k]["done"] for k in panel["items"]):
+            menu.append(("Clear done notes", lambda: self.clear_done(panel)))
         menu += [
             None,
             ("Delete panel", lambda: self.delete_panel(panel), "danger"),
@@ -1002,7 +1072,7 @@ class StickyApp:
         self.make_entry(box, self.font).pack(fill="x", ipady=2)
         tk.Label(
             box,
-            text="Paste PR/issue links · Enter adds · Esc closes",
+            text="PR/issue links, or type a note · Enter adds · Esc closes",
             bg=CARD_BG,
             fg=FG_DIM,
             font=self.font_small,
@@ -1032,6 +1102,122 @@ class StickyApp:
 
     def reset_confirm(self, button):
         button.configure(text=self.glyphs["delete"], font=self.font_icon, fg=FG_DIM)
+
+    def render_note(self, card, panel, panels, key, width):
+        note = self.state["notes"][key]
+        done = note["done"]
+        editing = self.edit if self.edit and self.edit.get("key") == key else None
+
+        row = tk.Frame(card, bg=CARD_BG)
+        row.pack(fill="x")
+        box = tk.Label(
+            row,
+            image=self.icons["check-done" if done else "check-empty"],
+            bg=CARD_BG,
+            cursor="hand2",
+        )
+        box.pack(side="left", anchor="n", padx=(INDENT, 10), pady=(6, 0))
+        box.bind("<Button-1>", self.later(lambda: self.toggle_done(key)))
+        side = tk.Frame(row, bg=CARD_BG)
+        side.pack(side="right", anchor="n", fill="y")
+        more = tk.Label(
+            side, text=self.glyphs["more"], bg=CARD_BG, fg=FG_DIM, font=self.font_icon, padx=8
+        )
+        more.pack(pady=(6, 0))
+
+        body = tk.Frame(row, bg=CARD_BG)
+        body.pack(side="left", fill="x", expand=True, pady=5)
+        if editing and editing["field"] == "note":
+            self.make_entry(body, self.font).pack(fill="x", padx=(0, 4))
+            return
+        # Notes wrap instead of eliding: a reminder is useless half-shown.
+        text = tk.Label(
+            body,
+            text=note["text"],
+            bg=CARD_BG,
+            fg=FG_DIM if done else FG,
+            font=self.font_done if done else self.font,
+            anchor="w",
+            justify="left",
+            wraplength=width - INDENT - 26 - 32 - 8,
+        )
+        text.pack(fill="x")
+        text.bind(
+            "<Double-Button-1>",
+            self.later(lambda: self.start_edit(panel, "note", key=key)),
+        )
+        if editing and editing["field"] == "link":
+            self.make_entry(body, self.font).pack(fill="x", padx=(0, 4), pady=(4, 0))
+            tk.Label(
+                body,
+                text="Paste the PR/issue link · Enter links · Esc cancels",
+                bg=CARD_BG,
+                fg=FG_DIM,
+                font=self.font_small,
+                anchor="w",
+            ).pack(fill="x")
+            return
+        widgets = [row, side, more, body, text]
+
+        # Hover actions float over the right end of the row, so wrapped text
+        # doesn't reflow every time the pointer passes.
+        actions = tk.Frame(row, bg=BG_HOVER)
+        delete = self.flat_button(
+            actions, self.glyphs["delete"], lambda: None, bg=BG_HOVER, icon=True
+        )
+        delete.bind(
+            "<Button-1>",
+            self.later(
+                lambda: self.confirm(
+                    delete, "Remove?", lambda: self.remove_item(panel, key)
+                )
+            ),
+        )
+        delete.pack(side="right")
+        buttons = [
+            ("down", lambda: self.move(panel["items"], key, 1)),
+            ("up", lambda: self.move(panel["items"], key, -1)),
+            ("add", lambda: self.start_edit(panel, "add")),
+        ]
+        for glyph, command in buttons:
+            self.flat_button(
+                actions, self.glyphs[glyph], command, bg=BG_HOVER, icon=True
+            ).pack(side="right")
+
+        def set_hover(hovered):
+            for widget in [*widgets, box]:
+                widget.configure(bg=BG_HOVER if hovered else CARD_BG)
+            more.configure(fg=FG if hovered else FG_DIM)
+            if not done:
+                name = "check-empty-hover" if hovered else "check-empty"
+                box.configure(image=self.icons[name])
+            if hovered:
+                actions.place(in_=row, relx=1.0, x=-34, y=4, anchor="ne")
+                actions.lift()
+            else:
+                actions.place_forget()
+                self.reset_confirm(delete)
+
+        menu = [
+            ("Edit", lambda: self.start_edit(panel, "note", key=key)),
+            ("Mark as not done" if done else "Mark as done", lambda: self.toggle_done(key)),
+            ("Link to PR/issue…", lambda: self.start_edit(panel, "link", key=key)),
+            ("Copy text", lambda: self.copy(note["text"])),
+            None,
+            ("Move up", lambda: self.move(panel["items"], key, -1)),
+            ("Move down", lambda: self.move(panel["items"], key, 1)),
+        ]
+        menu += [
+            (f"Move to {p['title']}", lambda p=p: self.move_item(key, panel, p))
+            for p in panels
+            if p is not panel
+        ]
+        menu += [None, ("Remove", lambda: self.remove_item(panel, key), "danger")]
+
+        self.hover(row, [*widgets, box], lambda: set_hover(True), lambda: set_hover(False))
+        for widget in [*widgets, box]:
+            widget.bind(RIGHT_CLICK, lambda e: self.show_popup(e, menu))
+        more.bind("<Button-1>", lambda e: self.show_popup(e, menu))
 
     def render_item(self, card, panel, panels, key, width):
         info = self.state.get("cache", {}).get(key, {})
@@ -1491,6 +1677,45 @@ ICONS = {
         "QSCzLKtrX76JpMhS/t2cjMje3g+mJ4FAo3v1moN/PZqQt7QhSRIOnUFRXQ9YHzZXkMN5dZvd"
         "uvf8fBcO9bw/Xvj6Xe0vAuzzidbWVrHObmdoI/YYSTcEwFFtvNLS1PJFJtKTXa6GVSnmV8/f"
         "vrsYS4Dwv5dL9BvBHw/EJhY9B4spAAAAAElFTkSuQmCC"
+    ),
+    "check-empty": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAB6klEQVR42qVTz2sTURD+5v1o"
+        "RLEotWoPQmM8Ge85qUUQITcPCXgTxFJ1UTCUxdPLHntVC23q4ln2L1AoSU5exYOH0IuXPagn"
+        "W9psdveNh2TTTW0U9Ls8mG++YeabeYQcmJk6nY7s9XqEKQjDMPU8zx7HTRUdhTFGTIiYmYiI"
+        "V9dWT189d+WJtel8kiQgooxnIQS01oO9/T3fcRo7mYaYmZrNJi0unpkle3IbhGIURV8JkAww"
+        "ABARmNlqpWeFEOeTqH/jwaNnnwAm1Wq1lOd5cWvj9WOtbenb95+XXNfdnda+v7W+baV4SYTr"
+        "xjSlOjTQXoyidMd13d3N5WUdLiykeWGlUtHVajWK4/ijEPIuAJTLX1jlcmJBNDMa6Ten2+12"
+        "OhxHnGLmJIsfuklEDPDw+SMs5TYm8J+YLMD811vIVptB5a8QQMzMFASBahtjsbQ0YjsAoIwx"
+        "YOYBHVeACImUam7kwQAA4Hm5VC8BgK3NVxes5XHnKgzDlBnk++kbLU88fOtvfBgMos8CUlpY"
+        "OzaYmaVUZwuFmfv7/YN7Q3kNstvtMmBEo/Hix+1bN98XCoU7DFyzbC8TUCKgxERFElTUSs0f"
+        "RP3nKytP3xljhOM4Fkc8+LfPlCfK5TIFQYBabVIUBEBtFKzX6+Mr/QWE/dvQ2WxpjgAAAABJ"
+        "RU5ErkJggg=="
+    ),
+    "check-empty-hover": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAABuUlEQVR42p1TTWsTURQ9581M"
+        "PiqptLFqaVFcKETcSPb+iyxcuvYfuMkP6G9wr+Q3lFkYEGUC4iYQCq2UlJC0mlqcJPPxjovO"
+        "hNjEUnrhweO+e86999z7iAWTRABOp9Mh/mP1ej0laZceMvCNTJLJ724OJql2u1158fzp2yS1"
+        "W3EUAwABwBgKAEqlcnR++us9yYMcwywzx0dH67xb2Sf0JJxOfkB0AAkADA0EWc8rrDuOcz8K"
+        "p6+2dna+ASCCIPAAYNA/fjf+ORx3u93KdeWfDQf7g5PjTwDg+74778XKPgz/TA5qtdpFEASe"
+        "JLN4er1eEQCiWfQZwiYAjEYjuTkByRhkIWtpSWlJKQAYx9yxsknuNwsxBCTyUrBrRmABchXB"
+        "rewKAW+wC//GuAsNEFZxpoEr6eq2ub7vg0QErSAgmTieW800iFakTgBgeNJ/INl55czWUqf9"
+        "/rNiZe1LmiZfp5PJd5CO0eUkLEjAquC5G8Xy2puL89+vt3cffZDkMN9tkvbwsPeyulHdm0Wz"
+        "e0mccN4vJcKoXComYRjube8+/phjbvWZms2mWZj90i9jq9VaCWw0Grleae77C4Z44BlCvIor"
+        "AAAAAElFTkSuQmCC"
+    ),
+    "check-done": (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAACL0lEQVR42o2Tv2tTURTHP+fe"
+        "95LUJK1irUXQf8BBSqFaF8WhOhS3bOKgBRcdRKHg4GtwEru6iENHbQeXYsGp/0DRQUJxcFAo"
+        "QmuqJG3ey7vvHoc2aWoq+IUDB+79fs9voReqcmUO2zyzJhyJcaY3yKpV8Uc86j9I/YgiNR1f"
+        "OpER0ZvPN8uSO3FX1Q9510ZFuqIiooHNZUmrvrjyZORLhyOoSjSH1AZ/H4+1sJIv5yeyFOSv"
+        "fFTBWEjj9Kdvt6eWZ4sfI0XM+Ku1oFoVv5MFd/Ll/ETrVzNJWzuuvXtgyU7DuSRxcaMZB7nw"
+        "JMY8A9HVuVXTU4sMeYcXIxYlANk3AhMMBK5VD0SCMHOooEWAkdpmTzOMOsAAiA0BRb3DFops"
+        "fVpgfeEaLq5jLKKqWYdneiYo+0q4Vh1MQFgaZLu2zLf3Dxi9/IigeAr1ex3tE8B7MJDF26wv"
+        "XKX+eZHdH+t8fXebs1MvGJ2cQdO4b6RB1zMG9RAcG2b00kO+f3iM+ozhC7cYuXifdqPRP5pD"
+        "AoAo6l2b05P3wFjirXXOXZ8na+8iYlAFUBC0X0ARsYhAljYbMjw2gxhwSbOzSYBmIAbVsJv4"
+        "9MZ4BirqszdpK93OlUr5sFC21mAN2LBQsuFAyYb5og0HSjkxCGJeAlCp7K1yFKmpVsXfmG+O"
+        "FYLCU5e5QTInh2pW1OZCnyXJ6+XZ8lsiNRw6Kv3/Y+r9e9ADEY0iNbXzCEtLRxMrFQCWRLqL"
+        "9AdCu/jGotPVAAAAAABJRU5ErkJggg=="
     ),
 }
 

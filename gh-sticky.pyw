@@ -114,16 +114,45 @@ mutation($id: ID!, $state: SubscriptionState!) {
 # Notes share the panels' item lists with GitHub keys; their text and done
 # state live in state["notes"] under keys with this prefix.
 NOTE_PREFIX = "note:"
+URL_RE = re.compile(r"https?://\S+")
+GITHUB_URL_RE = re.compile(r"https?://(www\.)?github\.com/")
 NOTIFICATION_RE = re.compile(r"/repos/([^/]+)/([^/]+)/(?:pulls|issues)/(\d+)$")
 
 
 def parse_items(text):
     """Return `owner/repo#number` keys for every GitHub reference in text."""
-    return [f"{o}/{r}#{n}" for o, r, n in ITEM_RE.findall(text or "")]
+    # Blank out non-GitHub URLs first: a/b#12 inside another site's URL is
+    # not a GitHub issue.
+    text = URL_RE.sub(
+        lambda m: m.group(0) if GITHUB_URL_RE.match(m.group(0)) else " ", text or ""
+    )
+    return [f"{o}/{r}#{n}" for o, r, n in ITEM_RE.findall(text)]
 
 
 def is_note(key):
     return key.startswith(NOTE_PREFIX)
+
+
+def split_url(text):
+    """Return (text without the first URL, that URL or None)."""
+    match = URL_RE.search(text or "")
+    if not match:
+        return text, None
+    # Trailing punctuation belongs to the sentence, not the URL.
+    url = match.group(0).rstrip(".,;)")
+    rest = text[: match.start()] + text[match.start() + len(url) :]
+    rest = re.sub(r"\s+([,.;:!?])", r"\1", re.sub(r"\s+", " ", rest))
+    return rest.strip(), url
+
+
+def link_label(url):
+    """A URL without its scheme and www, for showing it as text."""
+    return re.sub(r"^https?://(www\.)?", "", url).rstrip("/")
+
+
+def link_site(url):
+    """Just the host, for the note's link line."""
+    return link_label(url).split("/", 1)[0]
 
 
 def split_key(key):
@@ -676,9 +705,40 @@ class StickyApp:
 
     # --- notes: local text items with a checkbox ------------------------------
     def new_note(self, text):
+        """A note from typed text; a URL in it is attached as the note's link
+        (and stays the text when there's nothing else)."""
+        rest, url = split_url(text)
         key = f"{NOTE_PREFIX}{uuid.uuid4().hex[:8]}"
-        self.state.setdefault("notes", {})[key] = {"text": text, "done": False}
+        note = {"text": rest or text, "done": False}
+        if url:
+            note["url"] = url
+        self.state.setdefault("notes", {})[key] = note
         return key
+
+    def set_note_url(self, key, url):
+        note = self.state["notes"][key]
+        if url:
+            note["url"] = url
+        else:
+            note.pop("url", None)
+        self.changed()
+
+    def click_note(self, url):
+        # Delay opening so the second click of a double click (edit) can
+        # cancel it, like the panel title's toggle.
+        if self.click_job:
+            self.root.after_cancel(self.click_job)
+        self.click_job = self.root.after(250, lambda: self.open_url(url))
+
+    def open_url(self, url):
+        self.click_job = None
+        webbrowser.open(url)
+
+    def edit_note(self, panel, key):
+        if self.click_job:
+            self.root.after_cancel(self.click_job)
+            self.click_job = None
+        self.start_edit(panel, "note", key=key)
 
     def toggle_done(self, key):
         note = self.state["notes"][key]
@@ -730,6 +790,13 @@ class StickyApp:
             text = panel["title"]
         elif field == "note":
             text = self.state["notes"][key]["text"]
+        elif field == "link":
+            # Prefill with a link from the clipboard, or the current one.
+            try:
+                clipboard = split_url(self.root.clipboard_get())[1]
+            except tk.TclError:
+                clipboard = None
+            text = clipboard or self.state["notes"][key].get("url", "")
         else:
             try:
                 text = " ".join(parse_items(self.root.clipboard_get()))
@@ -827,11 +894,16 @@ class StickyApp:
             return
         keys = parse_items(text)
         if edit["field"] == "link":
-            if not keys:
+            # A GitHub PR/issue replaces the note; any other URL is attached.
+            url = split_url(text)[1]
+            if not keys and not url:
                 self.edit_entry.configure(highlightbackground=RED, highlightcolor=RED)
                 return
             self.edit = None
-            self.link_note(panel, edit["key"], keys[0])
+            if keys:
+                self.link_note(panel, edit["key"], keys[0])
+            else:
+                self.set_note_url(edit["key"], url)
             return
         # The add box: GitHub links become tracked items, anything else a note.
         if keys:
@@ -1132,34 +1204,67 @@ class StickyApp:
         if editing and editing["field"] == "note":
             self.make_entry(body, self.font).pack(fill="x", padx=(0, 4))
             return
+        url = note.get("url")
+        # A note that is only a link shows it without the https:// noise.
+        shown = link_label(url) if url and note["text"] == url else note["text"]
         # Notes wrap instead of eliding: a reminder is useless half-shown.
         text = tk.Label(
             body,
-            text=note["text"],
+            text=shown,
             bg=CARD_BG,
             fg=FG_DIM if done else FG,
             font=self.font_done if done else self.font,
             anchor="w",
             justify="left",
             wraplength=width - INDENT - 26 - 32 - 8,
+            cursor="hand2" if url else "",
         )
         text.pack(fill="x")
         text.bind(
             "<Double-Button-1>",
-            self.later(lambda: self.start_edit(panel, "note", key=key)),
+            self.later(lambda: self.edit_note(panel, key)),
         )
+        widgets = [row, side, more, body, text]
+        if url:
+            # Second line, like the repo line of a GitHub item: link icon and
+            # the site, so you can tell where a click goes (full URL in the
+            # tooltip).
+            link_line = tk.Frame(body, bg=CARD_BG, cursor="hand2")
+            link_line.pack(fill="x")
+            link_icon = tk.Label(
+                link_line,
+                text=self.glyphs["link"],
+                bg=CARD_BG,
+                fg=FG_DIM,
+                font=self.font_icon_small,
+            )
+            link_icon.pack(side="left", padx=(0, 4))
+            site = tk.Label(
+                link_line,
+                text=elide(link_site(url), self.font_small, width - INDENT - 90),
+                bg=CARD_BG,
+                fg=FG_DIM,
+                font=self.font_small,
+            )
+            site.pack(side="left")
+            Tooltip(self, site, url)
+            widgets += [link_line, link_icon, site]
+            # Delayed so a double click on the text edits instead of opening.
+            for widget in (text, link_line, link_icon, site):
+                widget.bind("<Button-1>", lambda e: self.click_note(url))
         if editing and editing["field"] == "link":
             self.make_entry(body, self.font).pack(fill="x", padx=(0, 4), pady=(4, 0))
             tk.Label(
                 body,
-                text="Paste the PR/issue link · Enter links · Esc cancels",
+                text="Paste any link · a GitHub PR/issue replaces the note · Esc cancels",
                 bg=CARD_BG,
                 fg=FG_DIM,
                 font=self.font_small,
                 anchor="w",
+                wraplength=width - INDENT - 26 - 32 - 8,
+                justify="left",
             ).pack(fill="x")
             return
-        widgets = [row, side, more, body, text]
 
         # Hover actions float over the right end of the row, so wrapped text
         # doesn't reflow every time the pointer passes.
@@ -1188,7 +1293,12 @@ class StickyApp:
             )
             button.pack(side="right")
             if glyph == "link":
-                Tooltip(self, button, "Link to a PR or issue: the note becomes that item.")
+                Tooltip(
+                    self,
+                    button,
+                    "Add a link. A GitHub PR or issue turns the note into that "
+                    "item; any other link is attached to the note.",
+                )
 
         def set_hover(hovered):
             for widget in [*widgets, box]:
@@ -1207,8 +1317,19 @@ class StickyApp:
         menu = [
             ("Edit", lambda: self.start_edit(panel, "note", key=key)),
             ("Mark as not done" if done else "Mark as done", lambda: self.toggle_done(key)),
-            ("Link to PR/issue…", lambda: self.start_edit(panel, "link", key=key)),
             ("Copy text", lambda: self.copy(note["text"])),
+            None,
+        ]
+        if url:
+            menu += [
+                ("Open link", lambda: webbrowser.open(url)),
+                ("Copy link", lambda: self.copy(url)),
+                ("Change link…", lambda: self.start_edit(panel, "link", key=key)),
+                ("Remove link", lambda: self.set_note_url(key, None)),
+            ]
+        else:
+            menu.append(("Add link…", lambda: self.start_edit(panel, "link", key=key)))
+        menu += [
             None,
             ("Move up", lambda: self.move(panel["items"], key, -1)),
             ("Move down", lambda: self.move(panel["items"], key, 1)),
@@ -1685,43 +1806,49 @@ ICONS = {
         "vrsYS4Dwv5dL9BvBHw/EJhY9B4spAAAAAElFTkSuQmCC"
     ),
     "check-empty": (
-        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAB6klEQVR42qVTz2sTURD+5v1o"
-        "RLEotWoPQmM8Ge85qUUQITcPCXgTxFJ1UTCUxdPLHntVC23q4ln2L1AoSU5exYOH0IuXPagn"
-        "W9psdveNh2TTTW0U9Ls8mG++YeabeYQcmJk6nY7s9XqEKQjDMPU8zx7HTRUdhTFGTIiYmYiI"
-        "V9dWT189d+WJtel8kiQgooxnIQS01oO9/T3fcRo7mYaYmZrNJi0unpkle3IbhGIURV8JkAww"
-        "ABARmNlqpWeFEOeTqH/jwaNnnwAm1Wq1lOd5cWvj9WOtbenb95+XXNfdnda+v7W+baV4SYTr"
-        "xjSlOjTQXoyidMd13d3N5WUdLiykeWGlUtHVajWK4/ijEPIuAJTLX1jlcmJBNDMa6Ten2+12"
-        "OhxHnGLmJIsfuklEDPDw+SMs5TYm8J+YLMD811vIVptB5a8QQMzMFASBahtjsbQ0YjsAoIwx"
-        "YOYBHVeACImUam7kwQAA4Hm5VC8BgK3NVxes5XHnKgzDlBnk++kbLU88fOtvfBgMos8CUlpY"
-        "OzaYmaVUZwuFmfv7/YN7Q3kNstvtMmBEo/Hix+1bN98XCoU7DFyzbC8TUCKgxERFElTUSs0f"
-        "RP3nKytP3xljhOM4Fkc8+LfPlCfK5TIFQYBabVIUBEBtFKzX6+Mr/QWE/dvQ2WxpjgAAAABJ"
-        "RU5ErkJggg=="
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAACeUlEQVR42n1TPWhTURT+zr3v"
+        "JWkatBUzCNalIAou6lB1yuDooEIr6ObPSyu0gS7S6ebioHSwSpOm76VFShDKC3QRR0lRx1JE"
+        "dBBEqUiLFi1o07TNyz0ONiXG2G88nPt93zn3fEALKKUspZRoKJFSymJmwl5gZmpsymQysUKh"
+        "sK+JvJEY1PiYiBgA8m4mKaTorwXBMSIhpJSfhaC5T0srd7XW60opobU2uwR11Vzufkd75MAc"
+        "Az3VanWmWgueAbIqyfSEQ5GbRCQq5fWL/YPDC3USqtvSWpspL/vStqxDwa/NszdSqdXmER9P"
+        "554Yw5cCI484TvJ7Oq3IUkpZWusgPznuENG55a8/Do6MjKwtuK79sbPTAEA8HqdEIlEjomtT"
+        "XvY1eMsjwmWlIOH7vZKZyZscfzc58SgLAK7r2s3qpVLJYmaamHh4Ie9meGxsrAMARF9fsTY6"
+        "OhoD0C1t+ZSZqXNHuRE7Drhti1+xMdVoNHQSAMTOEgUzW8xmu/4T/0O7bQcgYmYOA4BQSolK"
+        "pVImomUT4AwAisfj/xxMsVgUSimxZgfHiSgkRO0tAIhEAkJrHTCZWcsSKQA8Pz9v6jMzM/m+"
+        "LwFIrbURbN1h5jeOk/ri+72SmJnS6TR1dUXbiWMfCPT8+q3bV1vZ97xsfzQczpU3f55OJocX"
+        "fd+Xf92B6z44FbFjJWbzfnu7ei8c4MVmKBQYUz4RCbUNWpZ9pbKx4TgDQ3lmJYi0EQCgtTZK"
+        "KZFMDi+u/Vw9atgsSUvOblm8IlD9FrLCJSLRvb6x0eMMDOV935dE2rRK4W5QfNfdn8+PJ2am"
+        "3fMFzzu8W/+zj70T2aqJmak5iQDwGxwSPwSLWuR+AAAAAElFTkSuQmCC"
     ),
     "check-empty-hover": (
-        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAABuUlEQVR42p1TTWsTURQ9581M"
-        "PiqptLFqaVFcKETcSPb+iyxcuvYfuMkP6G9wr+Q3lFkYEGUC4iYQCq2UlJC0mlqcJPPxjovO"
-        "hNjEUnrhweO+e86999z7iAWTRABOp9Mh/mP1ej0laZceMvCNTJLJ724OJql2u1158fzp2yS1"
-        "W3EUAwABwBgKAEqlcnR++us9yYMcwywzx0dH67xb2Sf0JJxOfkB0AAkADA0EWc8rrDuOcz8K"
-        "p6+2dna+ASCCIPAAYNA/fjf+ORx3u93KdeWfDQf7g5PjTwDg+74778XKPgz/TA5qtdpFEASe"
-        "JLN4er1eEQCiWfQZwiYAjEYjuTkByRhkIWtpSWlJKQAYx9yxsknuNwsxBCTyUrBrRmABchXB"
-        "rewKAW+wC//GuAsNEFZxpoEr6eq2ub7vg0QErSAgmTieW800iFakTgBgeNJ/INl55czWUqf9"
-        "/rNiZe1LmiZfp5PJd5CO0eUkLEjAquC5G8Xy2puL89+vt3cffZDkMN9tkvbwsPeyulHdm0Wz"
-        "e0mccN4vJcKoXComYRjube8+/phjbvWZms2mWZj90i9jq9VaCWw0Grleae77C4Z44BlCvIor"
-        "AAAAAElFTkSuQmCC"
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAACG0lEQVR42n1TPW/UQBB9M/Yd"
+        "RCTkgAA6CZGGAkrSBImKjgIhKPgHfETiR1xBRw0/gAKETigd9RV0UQruBApCSBy2d71mjY1D"
+        "OOXsnIfGPh3RJSNtsbPzZue9mQHmWK/Xc0WE67uIkIi4IkI4zqrAaVAURYsicvpQDM/e3Vkw"
+        "EQkAWKOfsMMbRZFftT9DTmLjMbubgTbPiGhPRJiISgCgGgwAnue1WsuLmxBZ398fvyonxfuy"
+        "LAvHddcXFhYeCpiz3fTe6uqV7dkk07Ks0R/SJP6m9dfz8yjGcfT6lzUjpdRKRZfR6/VcADDa"
+        "fxxH4WQwGJypkjZExKnOVEBr9MdQ+5u12Oh2u46IkFH+59D/8bIGzxHYFREKguEdo31J0++t"
+        "6aO1O0uh8vYj7d2uSnPmdQgA0jRthcrLw9C/BQAMAI7TZABuTpTXnTjK8jw/ICIRkRMAwJ1O"
+        "h/t97y8RdOMAN6qf5g0MiwhPJuNrRNRsNunTlBsAGOU/t5GO6q7UnEWEKp2aAGDC4F2kgz4A"
+        "dLtdp54+tnZnKbYmim345qjyjQk2RnuZKDVcmyaYnQOlhmu7v5MsS+Ito7z7WRacS5JkWanh"
+        "zTSxb/9kqSjlP5rF0OyME1E5GAwuXmpfeCHA3aIoiJnFYSbXbfRH49HTdvvylog4RDT5bxeI"
+        "qKySRAAeJEmy7ECun2w0XD7Al1NnV4K67Bp83EY6R/j5sP8f5BCCY0MRiDIAAAAASUVORK5C"
+        "YII="
     ),
     "check-done": (
-        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAACL0lEQVR42o2Tv2tTURTHP+fe"
-        "95LUJK1irUXQf8BBSqFaF8WhOhS3bOKgBRcdRKHg4GtwEru6iENHbQeXYsGp/0DRQUJxcFAo"
-        "QmuqJG3ey7vvHoc2aWoq+IUDB+79fs9voReqcmUO2zyzJhyJcaY3yKpV8Uc86j9I/YgiNR1f"
-        "OpER0ZvPN8uSO3FX1Q9510ZFuqIiooHNZUmrvrjyZORLhyOoSjSH1AZ/H4+1sJIv5yeyFOSv"
-        "fFTBWEjj9Kdvt6eWZ4sfI0XM+Ku1oFoVv5MFd/Ll/ETrVzNJWzuuvXtgyU7DuSRxcaMZB7nw"
-        "JMY8A9HVuVXTU4sMeYcXIxYlANk3AhMMBK5VD0SCMHOooEWAkdpmTzOMOsAAiA0BRb3DFops"
-        "fVpgfeEaLq5jLKKqWYdneiYo+0q4Vh1MQFgaZLu2zLf3Dxi9/IigeAr1ex3tE8B7MJDF26wv"
-        "XKX+eZHdH+t8fXebs1MvGJ2cQdO4b6RB1zMG9RAcG2b00kO+f3iM+ozhC7cYuXifdqPRP5pD"
-        "AoAo6l2b05P3wFjirXXOXZ8na+8iYlAFUBC0X0ARsYhAljYbMjw2gxhwSbOzSYBmIAbVsJv4"
-        "9MZ4BirqszdpK93OlUr5sFC21mAN2LBQsuFAyYb5og0HSjkxCGJeAlCp7K1yFKmpVsXfmG+O"
-        "FYLCU5e5QTInh2pW1OZCnyXJ6+XZ8lsiNRw6Kv3/Y+r9e9ADEY0iNbXzCEtLRxMrFQCWRLqL"
-        "9AdCu/jGotPVAAAAAABJRU5ErkJggg=="
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAACtklEQVR42oVTQWhcVRQ95773"
+        "Z/7MJJM61BBLixQEkUK7ErUgSSG2SqEpwsymVVQEN7oQgwREvrNwEWwJinuzcTOzcKEJVYSm"
+        "m1JKgy4khCIW2oXWStNknD/z/3/vXRc2JNWiZ3m493AOnAM8BJOJ2iRR2WGUk4laqBL/CVUC"
+        "O0cvfqr1mS90z+6TB4UBPvBMKgCcOpe9AYMzvnCHRcRQ7M8klvtZb+H7ucZmkqi02ww7Avet"
+        "nf58q+Hz+Esbl06oB7wrAFWIKcFEgCvcdT/sv7I0t+fqtgh321odSb8tj1anh5t/FiCFgACA"
+        "IigZeVuOI19kv3u/eWT5/fHbSECZTC7adpvhWrX/WqlanR720pxkRNKAJAiKrYjP7kUuGxRR"
+        "XB4XjswD1EmsiIyv3dG/8+P14KHQYGgiAAoNDiau4Y8fF7G+eAx+uGFd7lRVX26e18al9jEn"
+        "3W7LN+dRB/GUL3KSRtzgLiAW0UgdG2vf4ObyO5g4+h5sbS99MVRbrlRTNzgE3M+Y1iFQjSgC"
+        "P9zA+uIU7v7UQfrbOn756lUcOP4JJp57E8HlAAlSSLAEADZJElm5jd7oiNwgedjWHg0Tz75r"
+        "bn03Cw0ee4+cxfgzbyPv9UCIAoYuH+TG4DoAGEytmEttuidf+OAxWylPuUHq608cNab0CMpj"
+        "+/H4SwsIeQqSAOBtXDG+yC9/PVv9rLl2yBCqTD4C1yoYHdjBD7ZUOVikW4WJ65YEfd4HFArA"
+        "0xhDEXjvnl6ara02Ox0j2+3rznHTe20FX/xaGq1HoRjQZVtBVQNEaOOaFRv5IsveWpqtrSaJ"
+        "SrfV8tzd8XabYTq5sy8eG/uYCKdEyg0KEFyeUszlbNj/8MLc2JVmR023Rf+vLe0eyvHz9xon"
+        "59PnZxaKqZlzemCbbzY75n8X2eyoeRj/zyUCwF+LVUF6OATTVQAAAABJRU5ErkJggg=="
     ),
 }
 

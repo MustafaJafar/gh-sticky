@@ -16,8 +16,9 @@ Claude desktop app.
   `owner/repo#123`) into a panel's add box. No filters or searches.
 - Anything else typed into the add box becomes a note: a local reminder with a
   checkbox, for things that have no issue or PR yet (a "TODO" panel moved to
-  the top works well). Double-click a note to edit it; "Link to PR/issue…" in
-  its menu turns it into the tracked item once one exists, and "Clear done
+  the top works well). Double-click a note to edit it; the link button on hover
+  (or "Link to PR/issue…" in its menu) turns it into the tracked item once one
+  exists, and "Clear done
   notes" in the panel menu removes the ticked ones.
 - Each item shows its title, `repo #number`, `+additions −deletions` and the
   review decision (approved / changes requested) for open PRs, and an icon for

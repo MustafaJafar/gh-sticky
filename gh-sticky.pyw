@@ -67,6 +67,7 @@ ICON_FONT_GLYPHS = {
     "refresh": "\ue72c",
     "expanded": "\ue70d",
     "collapsed": "\ue76c",
+    "link": "\ue71b",
 }
 # ...and plain text where that font is missing (Linux, macOS).
 TEXT_GLYPHS = {
@@ -79,6 +80,7 @@ TEXT_GLYPHS = {
     "refresh": "⟳",
     "expanded": "▾",
     "collapsed": "▸",
+    "link": "↗",
 }
 
 ITEM_RE = re.compile(
@@ -1177,12 +1179,16 @@ class StickyApp:
         buttons = [
             ("down", lambda: self.move(panel["items"], key, 1)),
             ("up", lambda: self.move(panel["items"], key, -1)),
+            ("link", lambda: self.start_edit(panel, "link", key=key)),
             ("add", lambda: self.start_edit(panel, "add")),
         ]
         for glyph, command in buttons:
-            self.flat_button(
+            button = self.flat_button(
                 actions, self.glyphs[glyph], command, bg=BG_HOVER, icon=True
-            ).pack(side="right")
+            )
+            button.pack(side="right")
+            if glyph == "link":
+                Tooltip(self, button, "Link to a PR or issue: the note becomes that item.")
 
         def set_hover(hovered):
             for widget in [*widgets, box]:

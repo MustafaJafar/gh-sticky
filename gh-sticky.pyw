@@ -361,12 +361,14 @@ def is_inside(widget, container):
 class Popup:
     """Themed stand-in for tk.Menu: a borderless list closing on focus loss.
 
-    Entries are `(label, command)`, `(label, command, "danger")` or None for
-    a separator.
+    Entries are `(label, command)`, `(label, command, "danger")`,
+    `(label, [entries])` for a submenu (opened on hover), or None for a
+    separator.
     """
 
-    def __init__(self, app, event, entries):
-        self.app = app
+    def __init__(self, app, x, y, entries, parent=None):
+        self.app, self.parent = app, parent
+        self.child = self.anchor = None
         self.top = top = tk.Toplevel(app.root)
         top.overrideredirect(True)
         top.attributes("-topmost", True)
@@ -376,44 +378,111 @@ class Popup:
         for entry in entries:
             if entry is None:
                 tk.Frame(frame, bg=BORDER, height=1).pack(fill="x", padx=4, pady=4)
-                continue
-            text, command, *flags = entry
-            label = tk.Label(
-                frame,
-                text=text,
-                bg=MENU_BG,
-                fg=RED if "danger" in flags else FG,
-                font=app.font,
-                anchor="w",
-                padx=10,
-                pady=3,
-            )
-            label.pack(fill="x")
-            label.bind("<Enter>", lambda e, w=label: w.configure(bg=BG_HOVER))
-            label.bind("<Leave>", lambda e, w=label: w.configure(bg=MENU_BG))
-            label.bind("<Button-1>", lambda e, c=command: self.choose(c))
+            else:
+                self.add_entry(frame, *entry)
 
         top.update_idletasks()
         width, height = top.winfo_reqwidth(), top.winfo_reqheight()
-        x, y = event.x_root + 2, event.y_root + 2
         left, top_edge, right, bottom = monitor_area(x, y) or (
             0, 0, top.winfo_screenwidth(), top.winfo_screenheight()
         )
-        # Open towards the inside when the menu would cross the monitor edge.
+        # Open towards the inside when the menu would cross the monitor edge;
+        # a submenu then opens on the left of its parent instead.
         if x + width > right:
-            x = max(left, x - width - 4)
+            if parent:
+                x = parent.top.winfo_rootx() - width + 2
+            x = max(left, x - (0 if parent else width + 4))
         if y + height > bottom:
-            y = max(top_edge, y - height - 4)
+            y = max(top_edge, bottom - height - 4 if parent else y - height - 4)
         top.geometry(f"+{x}+{y}")
-        top.bind("<FocusOut>", lambda e: self.close())
-        top.bind("<Escape>", lambda e: self.close())
-        top.focus_force()
+        # Clicking into a submenu moves focus there; check where focus went
+        # before treating it as "clicked away".
+        top.bind("<FocusOut>", lambda e: app.root.after(50, self.check_focus))
+        top.bind("<Escape>", lambda e: self.root_popup().close())
+        if not parent:
+            top.focus_force()
+
+    def add_entry(self, frame, text, target, *flags):
+        submenu = isinstance(target, list)
+        row = tk.Frame(frame, bg=MENU_BG)
+        row.pack(fill="x")
+        label = tk.Label(
+            row,
+            text=text,
+            bg=MENU_BG,
+            fg=RED if "danger" in flags else FG,
+            font=self.app.font,
+            anchor="w",
+            padx=10,
+            pady=3,
+        )
+        label.pack(side="left", fill="x", expand=True)
+        widgets = [row, label]
+        if submenu:
+            arrow = tk.Label(
+                row, text="›", bg=MENU_BG, fg=FG_DIM, font=self.app.font, padx=8
+            )
+            arrow.pack(side="right")
+            widgets.append(arrow)
+
+        def enter(_event):
+            for widget in widgets:
+                widget.configure(bg=BG_HOVER)
+            if submenu:
+                self.open_child(target, row)
+            elif self.child:
+                self.close_child()
+
+        def leave(_event):
+            for widget in widgets:
+                widget.configure(bg=MENU_BG)
+
+        for widget in widgets:
+            widget.bind("<Enter>", enter)
+            widget.bind("<Leave>", leave)
+            if submenu:
+                widget.bind("<Button-1>", lambda e: self.open_child(target, row))
+            else:
+                widget.bind("<Button-1>", lambda e: self.choose(target))
+
+    def open_child(self, entries, anchor):
+        if self.child and self.anchor is anchor:
+            return
+        self.close_child()
+        self.anchor = anchor
+        x = self.top.winfo_rootx() + self.top.winfo_width() - 2
+        self.child = Popup(self.app, x, anchor.winfo_rooty() - 5, entries, parent=self)
+
+    def close_child(self):
+        if self.child:
+            self.child.close()
+        self.child = self.anchor = None
+
+    def root_popup(self):
+        return self.parent.root_popup() if self.parent else self
+
+    def contains(self, widget):
+        return is_inside(widget, self.top) or bool(
+            self.child and self.child.contains(widget)
+        )
+
+    def check_focus(self):
+        menu = self.root_popup()
+        if not menu.top.winfo_exists():
+            return
+        try:
+            focus = self.app.root.focus_get()
+        except KeyError:
+            focus = None
+        if focus is None or not menu.contains(focus):
+            menu.close()
 
     def choose(self, command):
-        self.close()
+        self.root_popup().close()
         self.app.root.after_idle(command)
 
     def close(self):
+        self.close_child()
         if self.top.winfo_exists():
             self.top.destroy()
         if self.app.popup is self:
@@ -942,7 +1011,16 @@ class StickyApp:
     def show_popup(self, event, entries):
         if self.popup:
             self.popup.close()
-        self.popup = Popup(self, event, entries)
+        self.popup = Popup(self, event.x_root + 2, event.y_root + 2, entries)
+
+    def move_to_menu(self, key, panel, panels):
+        """A "Move to ›" submenu listing the other panels (none if alone)."""
+        others = [
+            (p["title"], lambda p=p: self.move_item(key, panel, p))
+            for p in panels
+            if p is not panel
+        ]
+        return [("Move to", others)] if others else []
 
     def hover(self, container, widgets, on_enter, on_leave):
         """Call on_enter/on_leave when the pointer enters/leaves the container.
@@ -1334,11 +1412,7 @@ class StickyApp:
             ("Move up", lambda: self.move(panel["items"], key, -1)),
             ("Move down", lambda: self.move(panel["items"], key, 1)),
         ]
-        menu += [
-            (f"Move to {p['title']}", lambda p=p: self.move_item(key, panel, p))
-            for p in panels
-            if p is not panel
-        ]
+        menu += self.move_to_menu(key, panel, panels)
         menu += [None, ("Remove", lambda: self.remove_item(panel, key), "danger")]
 
         self.hover(row, [*widgets, box], lambda: set_hover(True), lambda: set_hover(False))
@@ -1523,11 +1597,7 @@ class StickyApp:
             ("Move up", lambda: self.move(panel["items"], key, -1)),
             ("Move down", lambda: self.move(panel["items"], key, 1)),
         ]
-        menu += [
-            (f"Move to {p['title']}", lambda p=p: self.move_item(key, panel, p))
-            for p in panels
-            if p is not panel
-        ]
+        menu += self.move_to_menu(key, panel, panels)
         menu += [None, ("Remove", lambda: self.remove_item(panel, key), "danger")]
 
         self.hover(row, widgets, lambda: set_hover(True), lambda: set_hover(False))
